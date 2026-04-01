@@ -29,11 +29,29 @@ interface ApiConfig {
   baseUrl: string;
   authToken: string;
   model: string;
+  models: Record<string, string>;
 }
 
 function getHomeDir(): string {
   return process.env.HOME || process.env.USERPROFILE || 
     (process.platform === 'win32' ? 'C:\\Users\\' + process.env.USERNAME : '/home/' + process.env.USER);
+}
+
+function buildModelsMap(): Record<string, string> {
+  const models: Record<string, string> = {};
+  const envMap: Record<string, string> = {
+    ANTHROPIC_MODEL: 'default',
+    ANTHROPIC_SMALL_FAST_MODEL: 'small-fast',
+    ANTHROPIC_DEFAULT_OPUS_MODEL: 'opus',
+    ANTHROPIC_DEFAULT_SONNET_MODEL: 'sonnet',
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: 'haiku',
+  };
+  for (const [envKey, role] of Object.entries(envMap)) {
+    if (process.env[envKey]) {
+      models[role] = process.env[envKey]!;
+    }
+  }
+  return models;
 }
 
 function loadConfig(): ApiConfig | null {
@@ -55,6 +73,7 @@ function loadConfig(): ApiConfig | null {
           baseUrl: config.env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com',
           authToken: config.env.ANTHROPIC_AUTH_TOKEN,
           model: config.env.ANTHROPIC_MODEL || 'claude-sonnet-4-20250514',
+          models: buildModelsMap(),
         };
       }
     } catch {}
@@ -70,6 +89,7 @@ function loadConfig(): ApiConfig | null {
           baseUrl: config.baseUrl || 'https://api.anthropic.com',
           authToken: config.authToken,
           model: config.model || 'claude-sonnet-4-20250514',
+          models: buildModelsMap(),
         };
       }
     } catch {}
@@ -81,7 +101,8 @@ function loadConfig(): ApiConfig | null {
     return {
       baseUrl: process.env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com',
       authToken: token,
-      model: 'claude-sonnet-4-20250514',
+      model: process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-20250514',
+      models: buildModelsMap(),
     };
   }
 
@@ -151,10 +172,22 @@ async function runInteractiveMode(config: ApiConfig, initialModel: string) {
     prompt: chalk.cyan('litchi> '),
   });
 
+  const fetchRemoteModels = async (): Promise<string[]> => {
+    try {
+      const res = await fetch(`${config.baseUrl}/v1/models`, {
+        headers: { 'Authorization': `Bearer ${config.authToken}` },
+      });
+      if (!res.ok) return [];
+      const data = await res.json() as { data?: { id: string }[] };
+      return (data.data || []).map(m => m.id).sort();
+    } catch {
+      return [];
+    }
+  };
   const printWelcome = () => {
     console.log(chalk.dim('\n🚀 Interactive mode started'));
     console.log(chalk.dim('Type your messages and press Enter to send.'));
-    console.log(chalk.dim('Commands: /help, /exit, /clear, /model, /cost, /new'));
+    console.log(chalk.dim('Commands: /help, /exit, /clear, /model, /switch, /cost, /new'));
     console.log(chalk.dim('Multi-line: type "..." on a line by itself to send.\n'));
   };
 
@@ -164,10 +197,11 @@ async function runInteractiveMode(config: ApiConfig, initialModel: string) {
     console.log(chalk.cyan('  /exit       '), chalk.dim('Exit interactive mode'));
     console.log(chalk.cyan('  /quit       '), chalk.dim('Exit interactive mode'));
     console.log(chalk.cyan('  /clear      '), chalk.dim('Clear screen'));
-    console.log(chalk.cyan('  /model <id> '), chalk.dim('Switch model'));
+    console.log(chalk.cyan('  /model <id> '), chalk.dim('Switch model by ID or role name'));
+    console.log(chalk.cyan('  /models     '), chalk.dim('List configured models'));
+    console.log(chalk.cyan('  /switch     '), chalk.dim('Pick model from server list interactively'));
     console.log(chalk.cyan('  /cost       '), chalk.dim('Show token usage'));
     console.log(chalk.cyan('  /new        '), chalk.dim('Start new conversation'));
-    console.log(chalk.cyan('  /models     '), chalk.dim('List available models'));
     console.log(chalk.cyan('  ...        '), chalk.dim('On line by itself - send multi-line input'));
     console.log();
   };
@@ -181,10 +215,19 @@ async function runInteractiveMode(config: ApiConfig, initialModel: string) {
   };
 
   const showModels = () => {
-    console.log(chalk.bold('\n🤖 Available Models:\n'));
-    console.log(chalk.cyan(`  Current: ${currentModel}`));
-    console.log(chalk.dim('\n  Switch with: /model <model-id>'));
-    console.log(chalk.dim('  Example: /model claude-sonnet-4-6\n'));
+    console.log(chalk.bold('\n🤖 Configured Models:\n'));
+    console.log(chalk.cyan(`  Current: ${currentModel}\n`));
+    const entries = Object.entries(config.models);
+    if (entries.length > 0) {
+      const maxRole = Math.max(...entries.map(([r]) => r.length));
+      for (const [role, modelId] of entries) {
+        const marker = modelId === currentModel ? chalk.green(' ◀') : '';
+        console.log(chalk.dim(`  ${role.padEnd(maxRole)}  `) + chalk.cyan(modelId) + marker);
+      }
+    } else {
+      console.log(chalk.dim('  No models configured in settings'));
+    }
+    console.log(chalk.dim('\n  Switch: /model <model-id> or /model <role>\n'));
   };
 
   // Multi-line input handling
@@ -272,9 +315,47 @@ async function runInteractiveMode(config: ApiConfig, initialModel: string) {
     }
 
     if (input.startsWith('/model ')) {
-      currentModel = input.slice(7).trim();
-      console.log(chalk.green(`✅ Model set to: ${currentModel}\n`));
+      const value = input.slice(7).trim();
+      const resolved = config.models[value] || value;
+      currentModel = resolved;
+      if (config.models[value]) {
+        console.log(chalk.green(`✅ Model set to: ${resolved} (${value})\n`));
+      } else {
+        console.log(chalk.green(`✅ Model set to: ${resolved}\n`));
+      }
       rl.prompt();
+      return;
+    }
+
+    if (input === '/switch') {
+      rl.pause();
+      console.log(chalk.dim('\n⏳ Fetching models...\n'));
+      const remoteModels = await fetchRemoteModels();
+      if (remoteModels.length === 0) {
+        console.log(chalk.red('❌ Could not fetch model list from server\n'));
+        rl.resume();
+        rl.prompt();
+        return;
+      }
+      console.log(chalk.bold('🤖 Select a model:\n'));
+      remoteModels.forEach((m, i) => {
+        const marker = m === currentModel ? chalk.green(' ◀ current') : '';
+        console.log(chalk.dim(`  ${String(i + 1).padStart(2)}.`) + ' ' + chalk.cyan(m) + marker);
+      });
+      console.log(chalk.dim('\n  Enter number to select (or press Enter to cancel):'));
+      rl.question(chalk.cyan('  > '), (answer) => {
+        const num = parseInt(answer.trim(), 10);
+        if (!isNaN(num) && num >= 1 && num <= remoteModels.length) {
+          currentModel = remoteModels[num - 1];
+          console.log(chalk.green(`\n✅ Switched to: ${currentModel}\n`));
+        } else if (answer.trim() !== '') {
+          console.log(chalk.yellow('\n⚠ Invalid selection, model unchanged\n'));
+        } else {
+          console.log(chalk.dim('\n  Cancelled\n'));
+        }
+        rl.resume();
+        rl.prompt();
+      });
       return;
     }
 
