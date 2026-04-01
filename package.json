@@ -1,0 +1,43 @@
+{
+  "name": "claude-code-recovered",
+  "version": "2.1.88",
+  "description": "Claude Code 2.1.88 - Source Code Recovery Project",
+  "type": "module",
+  "bin": {
+    "claude": "./src/cli-bootstrap.ts"
+  },
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "dev": "bun run src/index.ts --watch",
+    "simple": "bun run src/cli-bootstrap.ts",
+    "version": "bun run src/index.ts --version",
+    "typecheck": "bun tsc --noEmit"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.52.0",
+    "@commander-js/extra-typings": "^12.1.0",
+    "chalk": "^5.3.0",
+    "commander": "^12.1.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.1.0",
+    "@types/node": "^20.14.0",
+    "@types/react": "^18.3.0",
+    "@types/react-dom": "^18.3.0",
+    "typescript": "^5.5.0"
+  },
+  "engines": {
+    "bun": ">=1.0.0"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "cli",
+    "ai",
+    "agent"
+  ],
+  "license": "MIT"
+}

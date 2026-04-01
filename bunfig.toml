@@ -1,0 +1,19 @@
+# Bun configuration for Claude Code Source Recovery
+# This handles the internal src/ imports used by the source code
+
+[install]
+# Use npm registry
+registry = "https://registry.npmjs.org/"
+
+[install.cache]
+# Cache location
+dir = "./.bun-cache"
+
+[run]
+# Enable bun's native module resolution
+tsconfig-paths = true
+
+[resolve]
+# Add src/ as a module resolution path (for internal imports like 'src/...')
+# This mirrors how the package works when installed as @anthropic-ai/claude-code
+alias = {}
