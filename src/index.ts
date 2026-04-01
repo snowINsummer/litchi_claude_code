@@ -42,11 +42,19 @@ function loadConfig(): ApiConfig | null {
   if (existsSync(claudeSettings)) {
     try {
       const config = JSON.parse(readFileSync(claudeSettings, 'utf-8'));
+      // Inject env vars from settings into process.env (lower priority than real env vars)
+      if (config.env) {
+        for (const [key, value] of Object.entries(config.env)) {
+          if (!process.env[key] && typeof value === 'string') {
+            process.env[key] = value;
+          }
+        }
+      }
       if (config.env?.ANTHROPIC_AUTH_TOKEN) {
         return {
           baseUrl: config.env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com',
           authToken: config.env.ANTHROPIC_AUTH_TOKEN,
-          model: 'claude-sonnet-4-20250514',
+          model: config.env.ANTHROPIC_MODEL || 'claude-sonnet-4-20250514',
         };
       }
     } catch {}
@@ -174,10 +182,9 @@ async function runInteractiveMode(config: ApiConfig, initialModel: string) {
 
   const showModels = () => {
     console.log(chalk.bold('\n🤖 Available Models:\n'));
-    console.log(chalk.cyan('  claude-sonnet-4-20250514 '), chalk.dim('(default, balanced)'));
-    console.log(chalk.cyan('  claude-opus-4-20250514   '), chalk.dim('(most capable)'));
-    console.log(chalk.cyan('  claude-3-5-sonnet-latest  '), chalk.dim('(legacy)'));
-    console.log(chalk.dim('\n  Note: Proxy APIs may support different models\n'));
+    console.log(chalk.cyan(`  Current: ${currentModel}`));
+    console.log(chalk.dim('\n  Switch with: /model <model-id>'));
+    console.log(chalk.dim('  Example: /model claude-sonnet-4-6\n'));
   };
 
   // Multi-line input handling
@@ -254,6 +261,12 @@ async function runInteractiveMode(config: ApiConfig, initialModel: string) {
 
     if (input === '/models') {
       showModels();
+      rl.prompt();
+      return;
+    }
+
+    if (input === '/model') {
+      console.log(chalk.cyan(`\n  Current model: ${currentModel}\n`));
       rl.prompt();
       return;
     }
@@ -347,6 +360,8 @@ async function main() {
     console.log(chalk.dim('  3. Or set ANTHROPIC_AUTH_TOKEN environment variable\n'));
     return;
   }
+
+  model = config.model || model;
 
   console.log(chalk.green('\n✓ API configured\n'));
   if (verbose) {
