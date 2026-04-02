@@ -1375,9 +1375,407 @@ claude> /model sonnet
 
 ---
 
-## 九、Hook / Permission 系统
+## 九、隐藏功能与实验特性
 
-### 9.1 权限模式
+Claude Code 包含大量通过 Feature Flag（`feature('FLAG_NAME')`）门控的隐藏功能。这些功能在 `cli-bootstrap.ts` 中默认关闭，需要通过环境变量 `CLAUDE_CODE_FEATURE_{NAME}=1` 开启。
+
+> **注意**: 以下功能多数为实验性质，部分需要 Claude.ai 订阅或特定后端服务支持，在自定义 API 网关环境下可能无法使用。
+
+### 9.1 Buddy — AI 宠物伴侣
+
+| 属性 | 值 |
+|------|-----|
+| Feature Flag | `BUDDY` |
+| 启用方式 | `CLAUDE_CODE_FEATURE_BUDDY=1` |
+| 命令 | `/buddy` |
+| 核心文件 | `src/buddy/CompanionSprite.tsx`, `src/buddy/prompt.ts`, `src/buddy/useBuddyNotification.tsx` |
+
+**功能**: 在终端输入框旁边显示一个 AI 宠物精灵（Companion Sprite），它会：
+- 闲置时播放动画
+- 对用户消息和 AI 回复做出反应（speech bubble）
+- 用户可以直接对宠物说话（按名字呼唤）
+
+**工作原理**:
+
+```
+用户输入 /buddy
+    │
+    ▼
+选择宠物种类 (species) + 命名 (name)
+    │
+    ▼
+存储到 config.companion = { name, species, ... }
+    │
+    ▼
+CompanionSprite 组件渲染在输入框旁边
+    │
+    ├── 闲置动画 (idle frames)
+    ├── 对 assistant 消息反应 (reaction bubble)
+    └── 注入 companion_intro attachment 到消息列表
+        让模型知道宠物的存在
+```
+
+**Teaser 机制**: 2026年4月1-7日期间，启动时会显示彩虹色 `/buddy` 提示（愚人节彩蛋）。之后命令永久可用。
+
+```typescript
+// src/buddy/useBuddyNotification.tsx
+export function isBuddyTeaserWindow(): boolean {
+  const d = new Date()
+  return d.getFullYear() === 2026 && d.getMonth() === 3 && d.getDate() <= 7
+}
+```
+
+### 9.2 Kairos — 主动助手模式 (Assistant Mode)
+
+| 属性 | 值 |
+|------|-----|
+| Feature Flag | `KAIROS` |
+| 启用方式 | `CLAUDE_CODE_FEATURE_KAIROS=1` |
+| 关联 Flag | `PROACTIVE`（主动行为）, `KAIROS_BRIEF`（简要视图）, `KAIROS_GITHUB_WEBHOOKS`（GitHub 事件订阅） |
+| 核心文件 | `src/proactive/`, `src/commands/assistant/`, `src/commands/brief.js` |
+
+**功能**: 将 Claude Code 变成一个**主动式助手**，不仅被动回答问题，还能：
+- **主动发起对话** — 监控文件变化、Git 事件等，在合适时机主动给出建议
+- **后台监听** — 在用户不输入时也保持活跃状态
+- **Brief 模式** — 提供简洁的摘要视图，适合持续监控
+- **GitHub Webhook 订阅** — 通过 `/subscribe-pr` 命令监听 PR 事件并主动响应
+
+**架构**:
+
+```
+┌──────────────────────────────────────┐
+│          Kairos / Proactive          │
+│                                       │
+│  ┌─────────────┐  ┌──────────────┐  │
+│  │ 事件监听器   │  │  主动触发器  │  │
+│  │ (file watch, │  │  (定时 cron, │  │
+│  │  git hooks)  │  │   webhooks)  │  │
+│  └──────┬──────┘  └──────┬───────┘  │
+│         │                │           │
+│         ▼                ▼           │
+│  ┌──────────────────────────────┐   │
+│  │   proactiveModule.isActive() │   │
+│  │   判断是否应该主动发言       │   │
+│  └──────────┬───────────────────┘   │
+│             │                        │
+│             ▼                        │
+│  ┌──────────────────────────────┐   │
+│  │  注入消息到 query loop       │   │
+│  │  (不需要用户输入即触发对话)  │   │
+│  └──────────────────────────────┘   │
+└──────────────────────────────────────┘
+```
+
+**与 Auto-Dream 的关系**: Kairos 模式下，`autoDream` 不会自动触发（因为 Kairos 有自己的 disk-skill dream 机制）。
+
+### 9.3 Auto-Dream — 后台记忆整合
+
+| 属性 | 值 |
+|------|-----|
+| Feature Flag | 无需 flag（通过 GrowthBook `tengu_onyx_plover` 或 settings 控制） |
+| 启用方式 | `settings.json` 中设置 `"autoDreamEnabled": true` |
+| 命令 | `/dream`（手动触发） |
+| 核心文件 | `src/services/autoDream/autoDream.ts`, `src/services/autoDream/config.ts`, `src/services/autoDream/consolidationPrompt.ts` |
+
+**功能**: 自动在后台整理和巩固 Claude Code 的记忆文件（memory），相当于 AI 的"做梦"过程 — 在空闲时回顾过去的对话，提炼有价值的信息写入记忆。
+
+**触发条件**（三重门控，按成本排序）：
+
+```
+1. 时间门: 距上次整合 >= 24小时 (可配置 minHours)
+2. 会话门: 自上次整合后至少有 5 个新会话 (可配置 minSessions)
+3. 锁机制: 没有其他进程正在整合
+```
+
+**执行流程**:
+
+```
+Stop Hook 触发 (每次模型回复结束后)
+    │
+    ▼
+isGateOpen()? — 检查: 非 Kairos + 非 Remote + autoMemory 开启 + autoDream 开启
+    │
+    ▼ YES
+时间门: readLastConsolidatedAt() → 24h 是否过了?
+    │
+    ▼ YES
+会话门: listSessionsTouchedSince() → 5+ 新会话?
+    │
+    ▼ YES
+tryAcquireConsolidationLock() → 获取锁
+    │
+    ▼
+runForkedAgent({                    ← 创建 forked 子代理
+  prompt: buildConsolidationPrompt(),  ← 包含记忆目录 + 会话列表
+  canUseTool: createAutoMemCanUseTool(), ← 只允许读取 + 写入 memory 文件
+  querySource: 'auto_dream',
+  skipTranscript: true,             ← 不写入对话记录
+})
+    │
+    ▼
+子代理: 阅读旧会话 → 提炼信息 → 更新 memory 文件
+    │
+    ▼
+completeDreamTask() + 通知主线程 "Improved N memory files"
+```
+
+**安全限制**: Dream 子代理的 Bash 工具被限制为只读命令（`ls`, `find`, `grep`, `cat` 等），不能修改文件系统（除了 memory 目录）。
+
+**配置**:
+
+```json
+// settings.json
+{
+  "autoDreamEnabled": true  // 启用自动做梦
+}
+```
+
+### 9.4 Daemon — 后台服务模式
+
+| 属性 | 值 |
+|------|-----|
+| Feature Flag | `DAEMON` + `BRIDGE_MODE` |
+| 启用方式 | `CLAUDE_CODE_FEATURE_DAEMON=1 CLAUDE_CODE_FEATURE_BRIDGE_MODE=1` |
+| 命令 | `claude daemon` / `claude --daemon-worker` |
+| 核心文件 | `src/entrypoints/cli.tsx`(入口), `src/bridge/bridgeMain.ts`, `src/bridge/bridgeEnabled.ts` |
+
+**功能**: 将 Claude Code 变成一个**后台守护进程**，通过 Remote Control (Bridge) 协议接受远程指令。
+
+**前提条件**:
+- 需要 Claude.ai **订阅用户**（OAuth Token 用于 CCR 认证）
+- 需要 GrowthBook gate `tengu_ccr_bridge` 启用
+
+**架构**:
+
+```
+┌────────────────────┐      ┌────────────────────┐
+│  远程客户端         │      │  Claude Code       │
+│  (claude.ai/code,  │◀────▶│  Daemon 进程       │
+│   Mobile App,      │      │                    │
+│   Web IDE)         │ WSS  │  ┌──────────────┐  │
+│                    │      │  │ Bridge Server │  │
+└────────────────────┘      │  │ (WebSocket)   │  │
+                            │  └──────┬───────┘  │
+                            │         │           │
+                            │         ▼           │
+                            │  ┌──────────────┐  │
+                            │  │ Query Loop   │  │
+                            │  │ (正常执行)   │  │
+                            │  └──────────────┘  │
+                            └────────────────────┘
+```
+
+### 9.5 UDS Inbox — 跨会话通信
+
+| 属性 | 值 |
+|------|-----|
+| Feature Flag | `UDS_INBOX` |
+| 启用方式 | `CLAUDE_CODE_FEATURE_UDS_INBOX=1` |
+| 命令 | `/peers`（查看连接的会话） |
+| 核心文件 | `src/setup.ts`, `src/cli/print.ts`, `src/utils/mailbox.ts`, `src/hooks/useInboxPoller.ts` |
+
+**功能**: 通过 **Unix Domain Socket (UDS)** 实现多个 Claude Code 会话之间的消息通信。
+
+**用途**:
+- 多个会话之间发送消息（比如 Swarm 中的 teammate 间通信）
+- Bridge/远程客户端向本地 REPL 注入消息
+- Headless 模式（`-p` print mode）接收外部触发的任务
+
+**架构**:
+
+```
+┌─────────────────┐     UDS Socket     ┌─────────────────┐
+│  Session A      │◀───────────────────▶│  Session B      │
+│  (REPL)         │                     │  (REPL)         │
+│                 │     /peers 查看     │                 │
+│  inbox poller   │     已连接对端      │  inbox poller   │
+└─────────────────┘                     └─────────────────┘
+        ▲                                       ▲
+        │              UDS Socket               │
+        └───────────────────────────────────────┘
+                        ▲
+                        │
+              ┌─────────────────┐
+              │  External Client│
+              │  (Bridge/IDE)   │
+              └─────────────────┘
+```
+
+**在 Swarm 模式中的角色**: Teammate 之间的 `SendMessage` 工具底层使用 Mailbox 文件系统 + UDS 实现消息传递。Leader 通过 mailbox 接收 worker 的权限请求，worker 通过 mailbox 接收权限响应。
+
+### 9.6 Teleport — 跨机器会话传送
+
+| 属性 | 值 |
+|------|-----|
+| Feature Flag | 无（始终编译，但需要 Claude.ai OAuth） |
+| 启用方式 | 需要 Claude.ai 订阅 + OAuth 登录 |
+| 命令 | `/teleport` |
+| 核心文件 | `src/utils/teleport.tsx`, `src/utils/teleport/api.ts`, `src/components/TeleportProgress.tsx` |
+
+**功能**: 将当前 Claude Code 会话**传送到远程机器**或**从远程恢复到本地**。
+
+**传送流程**:
+
+```
+本地机器 A                              远程机器 (CCR)
+┌──────────────┐                       ┌──────────────┐
+│ /teleport    │                       │              │
+│              │  1. 生成会话标题       │              │
+│              │  2. 创建 Git Bundle   │              │
+│              │  3. 上传到 CCR ──────▶│  创建远程    │
+│              │  4. 传送消息历史 ────▶│  会话实例    │
+│              │                       │              │
+│  [等待完成]  │◀─── 5. 远程执行完毕 ──│  执行任务    │
+│              │                       │              │
+│  6. 拉取远   │◀────────────────────  │  返回结果    │
+│  程分支+日志 │                       │  + Git diff  │
+│              │                       │              │
+│  7. checkout │                       │              │
+│  远程分支    │                       │              │
+└──────────────┘                       └──────────────┘
+```
+
+**核心功能**:
+- `teleportToRemote()` — 将本地会话上传到 CCR（Claude Code Remote）
+- `archiveRemoteSession()` — 归档远程会话
+- `fetchSession()` — 获取远程会话状态
+- `getBranchFromSession()` — 从远程拉取 Git 分支
+
+**前提条件**:
+- GitHub 仓库（需要 GitHub App 安装）
+- Claude.ai OAuth 登录
+- 远程环境已配置
+
+### 9.7 Ultraplan — 远程深度规划
+
+| 属性 | 值 |
+|------|-----|
+| Feature Flag | `ULTRAPLAN` |
+| 启用方式 | `CLAUDE_CODE_FEATURE_ULTRAPLAN=1` |
+| 命令 | `/ultraplan [描述]` |
+| 超时 | 30 分钟 |
+| 核心文件 | `src/commands/ultraplan.tsx`, `src/utils/ultraplan/ccrSession.ts`, `src/utils/ultraplan/prompt.txt` |
+
+**功能**: 将复杂的规划任务**传送到远程 CCR 服务器**，使用 Opus 模型进行深度多 Agent 探索和规划，最长 30 分钟。
+
+**与 Plan Mode 的区别**:
+
+| 特性 | `/plan` (本地) | `/ultraplan` (远程) |
+|------|---------------|-------------------|
+| 执行位置 | 本地 | CCR 远程服务器 |
+| 模型 | 当前模型 | Opus (强制) |
+| 时间限制 | 无 | 30 分钟 |
+| 多 Agent | 否 | 是（远程多 Agent 探索） |
+| 代码修改 | 可以 | 只产出 Plan，不修改代码 |
+| 费用 | 正常计费 | 可能产生 Extra Usage 费用 |
+
+**执行流程**:
+
+```
+/ultraplan "重构 auth 模块"
+    │
+    ▼
+checkRemoteAgentEligibility()      ← 检查前置条件
+    │
+    ▼
+buildUltraplanPrompt(blurb)        ← 构建远程 prompt
+    │
+    ▼
+teleportToRemote()                 ← 传送到 CCR
+    │                                (包含代码 + 对话历史)
+    ▼
+CCR 服务器:
+  ├── Opus 模型执行
+  ├── 多 Agent 探索代码库
+  ├── 生成详细实施方案
+  └── ExitPlanMode → 产出 Plan
+    │
+    ▼ (轮询 30min)
+pollForApprovedExitPlanMode()      ← 本地轮询结果
+    │
+    ▼
+收到 Plan → 显示给用户
+    │
+    ├── 用户批准 → 注入到本地会话，开始执行
+    └── 用户拒绝 → 丢弃
+```
+
+### 9.8 Ultrareview — 远程深度代码审查
+
+| 属性 | 值 |
+|------|-----|
+| Feature Flag | 无需 flag（通过 GrowthBook `tengu_ultrareview` 控制） |
+| 启用方式 | 需要 Claude.ai 订阅 |
+| 命令 | `/ultrareview [PR]` |
+| 核心文件 | `src/commands/review/ultrareviewCommand.tsx`, `src/commands/review/reviewRemote.ts`, `src/commands/review/ultrareviewEnabled.ts` |
+
+**功能**: 将 PR/代码审查任务**传送到远程 CCR 服务器**进行深度审查。
+
+**与 `/review` 的区别**:
+- `/review` — 本地执行，使用当前模型
+- `/ultrareview` — 远程执行，使用 Opus 模型，支持完整代码库探索
+
+**费用门控**:
+
+```typescript
+// src/commands/review/ultrareviewCommand.tsx
+const gate = await checkOverageGate()
+
+gate.kind === 'not-enabled'   → 免费额度已用完，提示开启 Extra Usage
+gate.kind === 'low-balance'   → 余额不足 $10
+gate.kind === 'needs-confirm' → 首次使用，显示确认对话框
+gate.kind === 'proceed'       → 直接执行
+```
+
+### 9.9 Feature Flag 总表
+
+以下是源码中所有已知的 Feature Flag：
+
+| Flag | 默认 | 说明 | 启用环境变量 |
+|------|------|------|-------------|
+| `BUDDY` | false | AI 宠物伴侣 | `CLAUDE_CODE_FEATURE_BUDDY=1` |
+| `KAIROS` | false | 主动助手模式 | `CLAUDE_CODE_FEATURE_KAIROS=1` |
+| `PROACTIVE` | false | 主动行为（Kairos 子集） | `CLAUDE_CODE_FEATURE_PROACTIVE=1` |
+| `KAIROS_BRIEF` | false | Kairos 简要视图 | `CLAUDE_CODE_FEATURE_KAIROS_BRIEF=1` |
+| `KAIROS_GITHUB_WEBHOOKS` | false | GitHub 事件订阅 | `CLAUDE_CODE_FEATURE_KAIROS_GITHUB_WEBHOOKS=1` |
+| `DAEMON` | false | 后台守护进程 | `CLAUDE_CODE_FEATURE_DAEMON=1` |
+| `BRIDGE_MODE` | false | Remote Control 桥接 | `CLAUDE_CODE_FEATURE_BRIDGE_MODE=1` |
+| `UDS_INBOX` | false | 跨会话 UDS 通信 | `CLAUDE_CODE_FEATURE_UDS_INBOX=1` |
+| `ULTRAPLAN` | false | 远程深度规划 | `CLAUDE_CODE_FEATURE_ULTRAPLAN=1` |
+| `FORK_SUBAGENT` | false | Fork 子代理模式 | `CLAUDE_CODE_FEATURE_FORK_SUBAGENT=1` |
+| `COORDINATOR_MODE` | false | Coordinator 协调者模式 | `CLAUDE_CODE_FEATURE_COORDINATOR_MODE=1` |
+| `VOICE_MODE` | false | 语音模式 | `CLAUDE_CODE_FEATURE_VOICE_MODE=1` |
+| `HISTORY_SNIP` | false | 历史裁剪优化 | `CLAUDE_CODE_FEATURE_HISTORY_SNIP=1` |
+| `WORKFLOW_SCRIPTS` | false | 工作流脚本 | `CLAUDE_CODE_FEATURE_WORKFLOW_SCRIPTS=1` |
+| `CCR_REMOTE_SETUP` | false | CCR 远程环境配置 | `CLAUDE_CODE_FEATURE_CCR_REMOTE_SETUP=1` |
+| `CCR_AUTO_CONNECT` | false | 自动连接 CCR | `CLAUDE_CODE_FEATURE_CCR_AUTO_CONNECT=1` |
+| `CCR_MIRROR` | false | CCR 镜像模式 | `CLAUDE_CODE_FEATURE_CCR_MIRROR=1` |
+| `TORCH` | false | Torch（未知用途） | `CLAUDE_CODE_FEATURE_TORCH=1` |
+| `EXPERIMENTAL_SKILL_SEARCH` | false | 实验性技能搜索 | `CLAUDE_CODE_FEATURE_EXPERIMENTAL_SKILL_SEARCH=1` |
+| `BG_SESSIONS` | false | 后台会话 | `CLAUDE_CODE_FEATURE_BG_SESSIONS=1` |
+
+### 9.10 自建适配注意事项
+
+这些隐藏功能大多依赖 Anthropic 的后端服务（CCR、GrowthBook、OAuth），在自建 Agent 场景下：
+
+| 功能 | 可自建 | 说明 |
+|------|--------|------|
+| **Buddy** | ✅ 可以 | 纯前端功能，只需 UI 层支持 |
+| **Auto-Dream** | ✅ 可以 | 核心是 forked agent + memory 文件操作，无外部依赖 |
+| **Kairos/Proactive** | ⚠️ 部分 | 主动监听逻辑可复用，但 GitHub Webhook 需自建 |
+| **UDS Inbox** | ✅ 可以 | 标准 Unix Domain Socket，无外部依赖 |
+| **Daemon** | ⚠️ 部分 | 守护进程模式可复用，但 Bridge 协议依赖 CCR |
+| **Teleport** | ❌ 不可 | 完全依赖 CCR 远程服务 |
+| **Ultraplan** | ❌ 不可 | 完全依赖 CCR 远程服务 |
+| **Ultrareview** | ❌ 不可 | 完全依赖 CCR 远程服务 |
+
+对于自建 Agent，最有参考价值的是 **Auto-Dream** 模式（后台记忆整合）和 **UDS Inbox**（多会话通信），它们的核心逻辑不依赖外部服务，可以直接移植。
+
+---
+
+## 十、Hook / Permission 系统
+
+### 10.1 权限模式
 
 ```typescript
 type PermissionMode = 'default' | 'plan' | 'bypassPermissions'
@@ -1389,7 +1787,7 @@ type PermissionMode = 'default' | 'plan' | 'bypassPermissions'
 | `plan` | 只允许只读操作，写操作需确认 |
 | `bypassPermissions` | 跳过权限检查，直接执行 |
 
-### 9.2 权限检查链路
+### 10.2 权限检查链路
 
 ```
 ┌──────────────────────────────────────────────────────────┐
@@ -1413,7 +1811,7 @@ type PermissionMode = 'default' | 'plan' | 'bypassPermissions'
 └──────────────────────────────────────────────────────────┘
 ```
 
-### 9.3 Hook 系统
+### 10.3 Hook 系统
 
 Hook 是用户可配置的 shell 命令，在特定事件时执行：
 
@@ -1442,9 +1840,9 @@ Hook 可以返回控制指令：
 
 ---
 
-## 十、上下文管理
+## 十一、上下文管理
 
-### 10.1 System Prompt 构建 (`src/constants/prompts.ts`)
+### 11.1 System Prompt 构建 (`src/constants/prompts.ts`)
 
 ```
 System Prompt 由多个 Section 组装:
@@ -1473,7 +1871,7 @@ System Prompt 由多个 Section 组装:
 └─────────────────────────────────────────┘
 ```
 
-### 10.2 上下文（User Context / System Context）
+### 11.2 上下文（User Context / System Context）
 
 ```typescript
 // src/context.ts
@@ -1489,7 +1887,7 @@ getSystemContext() → {
 }
 ```
 
-### 10.3 自动压缩 (Auto Compact)
+### 11.3 自动压缩 (Auto Compact)
 
 当上下文 token 数接近模型限制时，自动触发压缩：
 
@@ -1523,9 +1921,9 @@ getSystemContext() → {
 
 ---
 
-## 十一、UI 层
+## 十二、UI 层
 
-### 11.1 Ink + React 终端渲染
+### 12.1 Ink + React 终端渲染
 
 Claude Code 使用 **Ink** 框架（React for CLI）进行终端渲染：
 
@@ -1559,7 +1957,7 @@ Claude Code 使用 **Ink** 框架（React for CLI）进行终端渲染：
 └─────────────────────────────────────────┘
 ```
 
-### 11.2 核心 React Hooks
+### 12.2 核心 React Hooks
 
 | Hook | 职责 |
 |------|------|
@@ -1574,9 +1972,9 @@ Claude Code 使用 **Ink** 框架（React for CLI）进行终端渲染：
 
 ---
 
-## 十二、自建 Agent 实现参考
+## 十三、自建 Agent 实现参考
 
-### 12.1 最小可行架构
+### 13.1 最小可行架构
 
 从 Claude Code 源码提炼的核心 Agent 架构：
 
@@ -1610,7 +2008,7 @@ Claude Code 使用 **Ink** 框架（React for CLI）进行终端渲染：
 └─────────────────────────────────────────────┘
 ```
 
-### 12.2 核心模式提炼
+### 13.2 核心模式提炼
 
 #### 模式 1: Tool 定义模式
 
@@ -1777,7 +2175,7 @@ async function autoCompactIfNeeded(messages, model) {
 }
 ```
 
-### 12.3 关键设计原则
+### 13.3 关键设计原则
 
 从 Claude Code 源码中提炼的设计原则：
 
@@ -1792,7 +2190,7 @@ async function autoCompactIfNeeded(messages, model) {
 
 ---
 
-## 十三、关键文件索引
+## 十四、关键文件索引
 
 | 文件 | 核心职责 |
 |------|---------|
@@ -1821,7 +2219,7 @@ async function autoCompactIfNeeded(messages, model) {
 
 ---
 
-## 十四、数据流总结
+## 十五、数据流总结
 
 ```
 用户输入
