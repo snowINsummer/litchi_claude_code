@@ -1066,9 +1066,263 @@ CUSTOM_AGENT_DISALLOWED_TOOLS = [
 
 ---
 
-## 七、MCP (Model Context Protocol) 系统
+## 七、模型解析与多模型支持
 
-### 7.1 架构
+### 7.1 模型解析链路
+
+Claude Code 的模型系统有两层映射：**别名解析** → **API 调用**。
+
+```
+用户输入 (settings / agent config / --model / /model)
+    │
+    ▼
+parseUserSpecifiedModel()          ← src/utils/model/model.ts:445
+    │
+    ├── 是内置别名? (sonnet/opus/haiku/best/opusplan)
+    │       │
+    │       ▼
+    │   getDefaultSonnetModel()    ← ANTHROPIC_DEFAULT_SONNET_MODEL || 内置默认
+    │   getDefaultOpusModel()      ← ANTHROPIC_DEFAULT_OPUS_MODEL || 内置默认
+    │   getDefaultHaikuModel()     ← ANTHROPIC_DEFAULT_HAIKU_MODEL || 内置默认
+    │
+    └── 非内置别名?
+            │
+            ▼
+        原样透传 (modelInputTrimmed)   ← ★ 关键: 任意模型 ID 都会透传给 API
+    │
+    ▼
+normalizeModelStringForAPI()       ← 移除 [1m] 后缀
+    │
+    ▼
+API 调用 (ANTHROPIC_BASE_URL/v1/messages)
+```
+
+### 7.2 Agent 的模型解析 (`getAgentModel()`)
+
+子代理模型解析有额外的优先级逻辑（`src/utils/model/agent.ts:37`）：
+
+```
+Agent 配置中的 model 字段
+    │
+    ├── 1. CLAUDE_CODE_SUBAGENT_MODEL 环境变量 → 最高优先级，覆盖一切
+    │
+    ├── 2. 工具调用时指定的 model 参数 (toolSpecifiedModel)
+    │       └── 如果别名匹配父线程的模型族 → 直接使用父线程模型
+    │       └── 否则 → parseUserSpecifiedModel() 解析
+    │
+    ├── 3. Agent 定义中的 model 字段 (agentModel)
+    │       ├── "inherit" → 使用父线程模型 (经 getRuntimeMainLoopModel 解析)
+    │       ├── "haiku"   → getDefaultHaikuModel()
+    │       ├── "sonnet"  → getDefaultSonnetModel()
+    │       ├── "opus"    → getDefaultOpusModel()
+    │       └── 其他      → parseUserSpecifiedModel() 原样透传
+    │
+    └── 4. 默认值 → "inherit" (继承父线程)
+```
+
+### 7.3 内置别名与环境变量映射
+
+| 别名 | 解析函数 | 环境变量覆盖 | 默认值 |
+|------|---------|-------------|--------|
+| `sonnet` | `getDefaultSonnetModel()` | `ANTHROPIC_DEFAULT_SONNET_MODEL` | `claude-sonnet-4-6-*` |
+| `opus` | `getDefaultOpusModel()` | `ANTHROPIC_DEFAULT_OPUS_MODEL` | `claude-opus-4-6-*` |
+| `haiku` | `getDefaultHaikuModel()` | `ANTHROPIC_DEFAULT_HAIKU_MODEL` | `claude-haiku-4-5-*` |
+| `best` | `getBestModel()` | 同 opus | 同 opus |
+| `opusplan` | plan 模式用 opus，其余用 sonnet | — | — |
+| `inherit` | 继承父线程模型 | — | — |
+
+**小快模型**（用于 auto-compact 等内部操作）：
+
+| 用途 | 环境变量 | 默认值 |
+|------|---------|--------|
+| 小快模型 | `ANTHROPIC_SMALL_FAST_MODEL` | `getDefaultHaikuModel()` |
+| 主循环模型 | `ANTHROPIC_MODEL` | `getDefaultSonnetModel()` |
+
+### 7.4 支持非 Anthropic 模型 (Gemini / GPT / 其他)
+
+#### 核心原理
+
+`parseUserSpecifiedModel()` 对非内置别名**原样透传**（`src/utils/model/model.ts:501-505`）：
+
+```typescript
+// Preserve original case for custom model names (e.g., Azure Foundry deployment IDs)
+if (has1mTag) {
+  return modelInputTrimmed.replace(/\[1m\]$/i, '').trim() + '[1m]'
+}
+return modelInputTrimmed  // ← 非别名直接透传给 API
+```
+
+这意味着只要你的 API 网关能识别模型 ID，你可以使用**任意模型名称**。
+
+#### 前提：API 网关
+
+Claude Code 使用 Anthropic SDK 格式发送请求（`POST /v1/messages`，Anthropic 消息结构）。要使用非 Anthropic 模型，需要一个 **API 网关** 做协议转换：
+
+```
+Claude Code                        API 网关                     上游 API
+┌──────────┐    Anthropic 格式    ┌───────────────┐           ┌──────────┐
+│ /v1/     │──────────────────▶  │  路由 + 转换  │──────────▶│ Anthropic│
+│ messages │   model: claude-*   │               │           │ API      │
+│          │                     │  model 路由:  │           └──────────┘
+│          │   model: gemini-*   │  gemini-* →   │──────────▶┌──────────┐
+│          │                     │  转换为       │           │ Google   │
+│          │   model: gpt-*     │  Gemini 格式  │           │ AI API   │
+│          │                     │               │           └──────────┘
+│          │                     │  gpt-* →      │──────────▶┌──────────┐
+│          │                     │  转换为       │           │ OpenAI   │
+└──────────┘                     │  OpenAI 格式  │           │ API      │
+                                 └───────────────┘           └──────────┘
+```
+
+常用网关方案：
+- **One API / New API** — 国内常用，支持 Anthropic ↔ OpenAI ↔ Gemini 格式互转
+- **LiteLLM** — 开源代理，自动协议转换
+- **自建网关** — 根据 model ID 路由到不同上游
+
+#### 配置方式 1: 环境变量别名映射
+
+通过环境变量将内置别名映射到非 Anthropic 模型：
+
+```json
+// ~/.claude/settings.json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://your-gateway.example.com",
+    "ANTHROPIC_AUTH_TOKEN": "your-api-key",
+
+    "ANTHROPIC_MODEL": "claude-sonnet-4-20250514",
+
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "gemini-2.0-flash",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-4-20250514",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "gpt-4o"
+  }
+}
+```
+
+效果：
+
+| 别名 / 配置值 | 实际发送给网关的 model |
+|---------------|----------------------|
+| `haiku` | `gemini-2.0-flash` |
+| `sonnet` | `claude-sonnet-4-20250514` |
+| `opus` | `gpt-4o` |
+| `gemini-2.5-pro` (直接写) | `gemini-2.5-pro` |
+
+#### 配置方式 2: Agent 直接指定模型 ID
+
+在 Agent 配置中直接使用任意模型 ID（非别名会被原样透传）：
+
+```markdown
+<!-- .claude/agents/frontend-expert.md -->
+---
+description: "Frontend expert using Gemini for better UI/CSS generation"
+model: gemini-2.5-pro
+tools:
+  - Bash
+  - Read
+  - Edit
+  - Write
+  - Glob
+  - Grep
+---
+
+You are a frontend expert specializing in React, CSS, and modern web APIs.
+Focus on clean, responsive UI implementation.
+```
+
+```markdown
+<!-- .claude/agents/code-reviewer.md -->
+---
+description: "Code reviewer using GPT-4o for broad knowledge"
+model: gpt-4o
+tools:
+  - Read
+  - Glob
+  - Grep
+---
+
+You are a code reviewer. Analyze code for bugs, security issues, 
+and performance problems.
+```
+
+#### 配置方式 3: 子代理全局覆盖
+
+强制所有子代理使用同一个模型：
+
+```bash
+# 所有子代理统一使用 gemini-2.5-pro
+CLAUDE_CODE_SUBAGENT_MODEL=gemini-2.5-pro claude
+```
+
+#### 配置方式 4: 运行时切换
+
+交互模式中用 `/model` 命令切换到任意模型：
+
+```
+claude> /model gemini-2.5-pro
+✅ Model set to: gemini-2.5-pro
+
+claude> /model gpt-4o
+✅ Model set to: gpt-4o
+
+claude> /model sonnet
+✅ Model set to: claude-sonnet-4-6-... (解析别名)
+```
+
+#### 配置方式 5: 按场景混合使用多模型
+
+```json
+// ~/.claude/settings.json — 典型的多模型配置
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://your-gateway.example.com",
+    "ANTHROPIC_AUTH_TOKEN": "your-unified-api-key",
+
+    "ANTHROPIC_MODEL": "claude-sonnet-4-20250514",
+
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-4-20250514",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-4-20250514",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "gemini-2.0-flash",
+    "ANTHROPIC_SMALL_FAST_MODEL": "gemini-2.0-flash"
+  }
+}
+```
+
+配合 Agent 定义实现按任务选模型：
+
+```
+主对话循环: claude-sonnet-4 (ANTHROPIC_MODEL)
+  │
+  ├── Explore Agent: gemini-2.0-flash (model: haiku → 被映射)
+  │   用途: 快速代码搜索，Gemini Flash 便宜且快
+  │
+  ├── Frontend Agent: gemini-2.5-pro (model: gemini-2.5-pro 直接透传)
+  │   用途: 前端编码，Gemini 在 UI 生成上表现好
+  │
+  ├── Code Review Agent: gpt-4o (model: gpt-4o 直接透传)
+  │   用途: 代码审查，GPT 知识面广
+  │
+  └── Complex Reasoning: claude-opus-4 (model: opus → 被映射)
+      用途: 复杂架构决策，Opus 推理能力强
+```
+
+### 7.5 模型解析关键文件
+
+| 文件 | 职责 |
+|------|------|
+| `src/utils/model/model.ts` | 模型解析核心：`parseUserSpecifiedModel()`, `getMainLoopModel()`, 各 `getDefault*Model()` |
+| `src/utils/model/agent.ts` | Agent 模型解析：`getAgentModel()`, 别名匹配, Bedrock 区域继承 |
+| `src/utils/model/aliases.ts` | 别名定义：`MODEL_ALIASES = ['sonnet','opus','haiku','best',...]` |
+| `src/utils/model/providers.ts` | API 提供商检测：firstParty / bedrock / vertex / foundry |
+| `src/utils/model/modelOptions.ts` | `/model` 选择器的选项列表构建 |
+| `src/utils/model/modelStrings.ts` | 模型 ID 字符串常量 (按版本) |
+| `src/services/api/client.ts` | API 客户端创建，`ANTHROPIC_BASE_URL` 处理，认证头注入 |
+
+---
+
+## 八、MCP (Model Context Protocol) 系统
+
+### 8.1 架构
 
 ```
 ┌──────────────┐     ┌───────────────────┐     ┌──────────────┐
@@ -1081,7 +1335,7 @@ CUSTOM_AGENT_DISALLOWED_TOOLS = [
                     提供: Tools, Resources, Prompts
 ```
 
-### 7.2 核心文件
+### 8.2 核心文件
 
 | 文件 | 职责 |
 |------|------|
@@ -1092,7 +1346,7 @@ CUSTOM_AGENT_DISALLOWED_TOOLS = [
 | `services/mcp/MCPConnectionManager.tsx` | React 连接管理器 |
 | `tools/MCPTool/` | MCP 工具桥接 |
 
-### 7.3 MCP 工具注册流程
+### 8.3 MCP 工具注册流程
 
 ```
 1. 读取配置 (~/.claude/settings.json → mcpServers)
@@ -1104,7 +1358,7 @@ CUSTOM_AGENT_DISALLOWED_TOOLS = [
 7. 下一轮 query 时模型即可使用
 ```
 
-### 7.4 配置示例
+### 8.4 配置示例
 
 ```json
 // ~/.claude/settings.json
@@ -1121,9 +1375,9 @@ CUSTOM_AGENT_DISALLOWED_TOOLS = [
 
 ---
 
-## 八、Hook / Permission 系统
+## 九、Hook / Permission 系统
 
-### 8.1 权限模式
+### 9.1 权限模式
 
 ```typescript
 type PermissionMode = 'default' | 'plan' | 'bypassPermissions'
@@ -1135,7 +1389,7 @@ type PermissionMode = 'default' | 'plan' | 'bypassPermissions'
 | `plan` | 只允许只读操作，写操作需确认 |
 | `bypassPermissions` | 跳过权限检查，直接执行 |
 
-### 8.2 权限检查链路
+### 9.2 权限检查链路
 
 ```
 ┌──────────────────────────────────────────────────────────┐
@@ -1159,7 +1413,7 @@ type PermissionMode = 'default' | 'plan' | 'bypassPermissions'
 └──────────────────────────────────────────────────────────┘
 ```
 
-### 8.3 Hook 系统
+### 9.3 Hook 系统
 
 Hook 是用户可配置的 shell 命令，在特定事件时执行：
 
@@ -1188,9 +1442,9 @@ Hook 可以返回控制指令：
 
 ---
 
-## 九、上下文管理
+## 十、上下文管理
 
-### 9.1 System Prompt 构建 (`src/constants/prompts.ts`)
+### 10.1 System Prompt 构建 (`src/constants/prompts.ts`)
 
 ```
 System Prompt 由多个 Section 组装:
@@ -1219,7 +1473,7 @@ System Prompt 由多个 Section 组装:
 └─────────────────────────────────────────┘
 ```
 
-### 9.2 上下文（User Context / System Context）
+### 10.2 上下文（User Context / System Context）
 
 ```typescript
 // src/context.ts
@@ -1235,7 +1489,7 @@ getSystemContext() → {
 }
 ```
 
-### 9.3 自动压缩 (Auto Compact)
+### 10.3 自动压缩 (Auto Compact)
 
 当上下文 token 数接近模型限制时，自动触发压缩：
 
@@ -1269,9 +1523,9 @@ getSystemContext() → {
 
 ---
 
-## 十、UI 层
+## 十一、UI 层
 
-### 10.1 Ink + React 终端渲染
+### 11.1 Ink + React 终端渲染
 
 Claude Code 使用 **Ink** 框架（React for CLI）进行终端渲染：
 
@@ -1305,7 +1559,7 @@ Claude Code 使用 **Ink** 框架（React for CLI）进行终端渲染：
 └─────────────────────────────────────────┘
 ```
 
-### 10.2 核心 React Hooks
+### 11.2 核心 React Hooks
 
 | Hook | 职责 |
 |------|------|
@@ -1320,9 +1574,9 @@ Claude Code 使用 **Ink** 框架（React for CLI）进行终端渲染：
 
 ---
 
-## 十一、自建 Agent 实现参考
+## 十二、自建 Agent 实现参考
 
-### 11.1 最小可行架构
+### 12.1 最小可行架构
 
 从 Claude Code 源码提炼的核心 Agent 架构：
 
@@ -1356,7 +1610,7 @@ Claude Code 使用 **Ink** 框架（React for CLI）进行终端渲染：
 └─────────────────────────────────────────────┘
 ```
 
-### 11.2 核心模式提炼
+### 12.2 核心模式提炼
 
 #### 模式 1: Tool 定义模式
 
@@ -1523,7 +1777,7 @@ async function autoCompactIfNeeded(messages, model) {
 }
 ```
 
-### 11.3 关键设计原则
+### 12.3 关键设计原则
 
 从 Claude Code 源码中提炼的设计原则：
 
@@ -1538,7 +1792,7 @@ async function autoCompactIfNeeded(messages, model) {
 
 ---
 
-## 十二、关键文件索引
+## 十三、关键文件索引
 
 | 文件 | 核心职责 |
 |------|---------|
@@ -1567,7 +1821,7 @@ async function autoCompactIfNeeded(messages, model) {
 
 ---
 
-## 十三、数据流总结
+## 十四、数据流总结
 
 ```
 用户输入
